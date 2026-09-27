@@ -7,6 +7,9 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
+# 获取执行 sudo 的实际用户（若直接使用 root 登录则指向 root）
+REAL_USER="${SUDO_USER:-$USER}"
+
 # 获取系统当前实际监听的 SSH 端口（若提取失败则回退为 22）
 CURRENT_SSH_PORT=$(ss -tlnp 2>/dev/null | grep -E 'sshd|systemd' | grep -oE ':[0-9]+' | head -n1 | tr -d ':' || echo "22")
 [[ -z "$CURRENT_SSH_PORT" ]] && CURRENT_SSH_PORT="22"
@@ -81,6 +84,11 @@ alias dce="docker compose exec"
 EOF
 chmod +x "${ALIAS_FILE}"
 
+# 确保非登录交互式 Shell 也自动加载别名
+if ! grep -q "custom_aliases.sh" /etc/bash.bashrc; then
+    echo '[ -f /etc/profile.d/custom_aliases.sh ] && source /etc/profile.d/custom_aliases.sh' >> /etc/bash.bashrc
+fi
+
 echo "==> 5. 系统更新与常用基础软件安装"
 apt update
 apt upgrade -y
@@ -99,7 +107,8 @@ else
     echo "    未提供 Cloudflare Token，跳过安装"
 fi
 
-echo "==> 7. 安装 Docker 及 Docker Compose 插件"
+echo "==> 7. 安装 Docker 及配置用户免 sudo 权限"
+# 清理旧版本冲突软件包
 OLD_PACKAGES=$(dpkg --get-selections docker.io docker-compose docker-doc podman-docker containerd runc 2>/dev/null | cut -f1 || true)
 if [[ -n "$OLD_PACKAGES" ]]; then
     apt remove -y $OLD_PACKAGES || true
@@ -125,12 +134,19 @@ apt update
 apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 systemctl enable --now docker
 
+# 将触发执行的用户添加到 docker 用户组并重载服务
+if [[ "$REAL_USER" != "root" ]]; then
+    echo "    正在将普通用户 ${REAL_USER} 添加至 docker 用户组..."
+    usermod -aG docker "${REAL_USER}"
+    systemctl restart docker
+fi
+
 echo "==> 8. 配置 SSH 端口与 UFW 防火墙"
 if [[ -f /etc/ssh/sshd_config ]]; then
     sed -i "s/^#*Port [0-9]*/Port ${SSH_PORT}/" /etc/ssh/sshd_config
 fi
 
-# 适配 systemd socket 监听
+# 适配 systemd socket 监听机制
 if systemctl is-active --quiet ssh.socket; then
     mkdir -p /etc/systemd/system/ssh.socket.d
     cat > /etc/systemd/system/ssh.socket.d/listen.conf << EOF
@@ -154,5 +170,11 @@ echo "=========================================="
 echo "  VPS 初始化完成！"
 echo "  主机名: $(hostname)"
 echo "  已放行并配置 SSH 端口: ${SSH_PORT}"
-echo "  警告: 请先开启新终端测试连接此端口，确认无误后再退出！"
+if [[ "$REAL_USER" != "root" ]]; then
+    echo "  注意: 用户 ${REAL_USER} 已加入 docker 组。"
+    echo "  - 重新通过 SSH 连接后即可免 sudo 使用 docker 以及自定义别名。"
+    echo "  - 若因 systemd 会话缓存导致 docker 仍报权限错误，可执行："
+    echo "    sudo loginctl terminate-user ${REAL_USER}"
+fi
+echo "  警告: 请先开启新终端测试连接此端口，确认无误后再退出当前终端！"
 echo "=========================================="
